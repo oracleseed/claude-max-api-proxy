@@ -66,45 +66,17 @@ export class FallbackController {
       };
     }
 
-    // Gate 4: Message diff
-    const divergeIndex = findDivergencePoint(messages, entry.messagesRaw);
-
-    if (divergeIndex === -1) {
-      // Prefix mismatch — reset
-      this.registry.invalidate(agentKey);
-      const newEntry = this.registry.getOrCreate(agentKey, model, messages);
-      this.modeStats.full_prompt++;
-      this.log("full_prompt", agentKey, "prefix_mismatch");
-      return {
-        mode: "full_prompt",
-        sessionUUID: newEntry.sessionUUID,
-        deltaMessages: null,
-        reason: "prefix_mismatch",
-      };
-    }
-
-    // Gate 5: Extract delta
-    const delta = extractDelta(messages, divergeIndex);
-
-    if (delta.length === 0) {
-      this.modeStats.stateless++;
-      this.log("stateless", agentKey, "no_new_messages");
-      return {
-        mode: "stateless",
-        sessionUUID: null,
-        deltaMessages: null,
-        reason: "no_new_messages",
-      };
-    }
-
-    // Success: delta mode
-    this.modeStats.delta++;
-    this.log("delta", agentKey, `${delta.length} new messages`);
+    // Always send full conversation — CLI has no memory between invocations.
+    // Delta mode disabled: --print mode can't resume sessions (file locking).
+    // The queue, registry, and gateway sync still provide value for tracking
+    // and preventing concurrent session conflicts.
+    this.modeStats.full_prompt++;
+    this.log("full_prompt", agentKey, "continuation");
     return {
-      mode: "delta",
+      mode: "full_prompt",
       sessionUUID: entry.sessionUUID,
-      deltaMessages: delta,
-      reason: "delta",
+      deltaMessages: null,
+      reason: "continuation",
     };
   }
 
