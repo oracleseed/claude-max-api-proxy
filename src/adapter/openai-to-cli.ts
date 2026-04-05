@@ -133,6 +133,41 @@ export function messagesToPrompt(
 }
 
 /**
+ * Format delta messages (user only) for CLI continuation.
+ * No system prompt or previous_response wrappers — CLI has them already.
+ */
+export function deltaToPrompt(
+  deltaMessages: OpenAIChatRequest["messages"]
+): string {
+  return deltaMessages
+    .map((msg) => extractText(msg.content))
+    .join("\n\n")
+    .trim();
+}
+
+/**
+ * Derive a deterministic agent key from system prompt + model.
+ * Uses first 200 chars of system message (stable identity portion)
+ * combined with model name. Returns undefined if no system message.
+ */
+export function deriveAgentKey(
+  messages: OpenAIChatRequest["messages"],
+  model: string
+): string | undefined {
+  const systemMsg = messages.find((m) => m.role === "system");
+  if (!systemMsg) return undefined;
+  const text = extractText(systemMsg.content);
+  if (!text) return undefined;
+  // Simple hash: djb2 on identity string
+  const identity = text.slice(0, 200) + "::" + model;
+  let hash = 5381;
+  for (let i = 0; i < identity.length; i++) {
+    hash = ((hash << 5) + hash + identity.charCodeAt(i)) & 0xffffffff;
+  }
+  return `agent-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/**
  * Convert OpenAI chat request to CLI input format
  */
 export function openaiToCli(request: OpenAIChatRequest): CliInput {

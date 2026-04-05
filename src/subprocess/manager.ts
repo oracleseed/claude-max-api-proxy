@@ -200,7 +200,6 @@ export class ClaudeSubprocess extends EventEmitter {
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
@@ -208,6 +207,9 @@ export class ClaudeSubprocess extends EventEmitter {
 
     if (options.sessionId) {
       args.push("--session-id", options.sessionId);
+      // Session persistence enabled — CLI manages session files
+    } else {
+      args.push("--no-session-persistence"); // Stateless fallback
     }
 
     return args;

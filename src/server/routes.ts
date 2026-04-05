@@ -7,13 +7,40 @@
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
-import { openaiToCli } from "../adapter/openai-to-cli.js";
+import {
+  openaiToCli,
+  messagesToPrompt,
+  deltaToPrompt,
+  deriveAgentKey,
+  extractModel,
+} from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
+import type { SessionRegistry } from "../session/manager.js";
+import type { FallbackController } from "../session/fallback.js";
+import type { RequestQueue } from "../session/queue.js";
+
+// Session components injected by server/index.ts
+let _registry: SessionRegistry | null = null;
+let _controller: FallbackController | null = null;
+let _queue: RequestQueue | null = null;
+let _gatewayConnected: () => boolean = () => false;
+
+export function initSessionComponents(
+  registry: SessionRegistry,
+  controller: FallbackController,
+  queue: RequestQueue,
+  gatewayConnected: () => boolean
+): void {
+  _registry = registry;
+  _controller = controller;
+  _queue = queue;
+  _gatewayConnected = gatewayConnected;
+}
 
 /**
  * Handle POST /v1/chat/completions
@@ -41,7 +68,61 @@ export async function handleChatCompletions(
       return;
     }
 
-    // Convert to CLI input format
+    // Session-aware routing
+    if (_controller && _registry && _queue) {
+      const model = extractModel(body.model);
+      const agentKey = deriveAgentKey(body.messages, body.model);
+
+      if (agentKey) {
+        const decision = _controller.decide(
+          agentKey,
+          model,
+          body.messages,
+          _gatewayConnected()
+        );
+
+        if (decision.mode !== "stateless") {
+          // Session-aware path: queue and execute with stable session UUID
+          try {
+            await _queue.enqueue(agentKey, async () => {
+              const prompt =
+                decision.mode === "delta" && decision.deltaMessages
+                  ? deltaToPrompt(decision.deltaMessages as any)
+                  : messagesToPrompt(body.messages);
+
+              const subprocess = new ClaudeSubprocess();
+              const cliInput = {
+                prompt,
+                model,
+                sessionId: decision.sessionUUID!,
+              };
+
+              if (stream) {
+                await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+              } else {
+                await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+              }
+
+              // Update registry on success
+              _registry!.updateHistory(
+                agentKey,
+                body.messages,
+                decision.mode === "full_prompt"
+              );
+            });
+            return; // Done — session-aware path handled it
+          } catch (err) {
+            // Queue timeout/full — fall through to stateless
+            _registry.incrementFallback(agentKey);
+            console.error(
+              `[Routes] Queue fallback for ${agentKey.slice(0, 8)}: ${(err as Error).message}`
+            );
+          }
+        }
+      }
+    }
+
+    // Stateless path (original behavior / fallback)
     const cliInput = openaiToCli(body);
     const subprocess = new ClaudeSubprocess();
 
@@ -411,9 +492,19 @@ export function handleModels(_req: Request, res: Response): void {
  * Health check endpoint
  */
 export function handleHealth(_req: Request, res: Response): void {
-  res.json({
+  const base: Record<string, any> = {
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
-  });
+  };
+
+  if (_registry && _controller) {
+    base.sessions = {
+      active: _registry.size,
+      gateway_connected: _gatewayConnected(),
+      mode_stats: _controller.getModeStats(),
+    };
+  }
+
+  res.json(base);
 }

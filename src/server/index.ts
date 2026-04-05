@@ -6,7 +6,12 @@
 
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
-import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
+import fs from "fs/promises";
+import { handleChatCompletions, handleModels, handleHealth, initSessionComponents } from "./routes.js";
+import { SessionRegistry } from "../session/manager.js";
+import { GatewaySync, parseGatewayConfig } from "../session/gateway-sync.js";
+import { FallbackController } from "../session/fallback.js";
+import { RequestQueue } from "../session/queue.js";
 
 export interface ServerConfig {
   port: number;
@@ -113,6 +118,64 @@ export async function startServer(config: ServerConfig): Promise<Server> {
   }
 
   const app = createApp();
+
+  // Initialize session-aware components
+  const homedir = process.env.HOME || "/tmp";
+  const registry = new SessionRegistry({
+    persistPath: `${homedir}/.claude-max-api-sessions-v2.json`,
+  });
+  await registry.loadFromDisk();
+
+  const controller = new FallbackController(registry);
+  const queue = new RequestQueue();
+  let gatewayConnected = false;
+
+  // Try to connect to OpenClaw gateway for session sync
+  try {
+    const configPath = `${homedir}/.openclaw/openclaw.json`;
+    const raw = await fs.readFile(configPath, "utf-8");
+    const gwConfig = parseGatewayConfig(JSON.parse(raw));
+    if (gwConfig) {
+      const sync = new GatewaySync({
+        ...gwConfig,
+        onSessionReset: (key) => {
+          for (const entry of registry.getAll()) {
+            if (entry.openclawSessionKey === key) {
+              registry.invalidate(entry.agentKey);
+            }
+          }
+        },
+        onSessionDelete: (key) => {
+          for (const entry of registry.getAll()) {
+            if (entry.openclawSessionKey === key) {
+              registry.remove(entry.agentKey);
+            }
+          }
+        },
+        onSessionCompact: (key) => {
+          for (const entry of registry.getAll()) {
+            if (entry.openclawSessionKey === key) {
+              registry.invalidate(entry.agentKey);
+            }
+          }
+        },
+        onConnectionChange: (connected) => {
+          gatewayConnected = connected;
+        },
+      });
+      sync.connect();
+      console.error("[Server] Gateway sync initialized");
+    } else {
+      console.error("[Server] No gateway config found, running stateless");
+      gatewayConnected = true; // Allow session mode without gateway sync
+    }
+  } catch {
+    console.error("[Server] Gateway sync unavailable, running stateless");
+    gatewayConnected = true; // Allow session mode without gateway sync
+  }
+
+  // Inject components into routes
+  initSessionComponents(registry, controller, queue, () => gatewayConnected);
 
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
