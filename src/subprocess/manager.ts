@@ -205,12 +205,10 @@ export class ClaudeSubprocess extends EventEmitter {
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
-    if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
-      // Session persistence enabled — CLI manages session files
-    } else {
-      args.push("--no-session-persistence"); // Stateless fallback
-    }
+    // Always use --no-session-persistence in --print mode.
+    // Claude Code locks session files, preventing reuse across invocations.
+    // Session tracking is managed by the proxy's SessionRegistry, not CLI files.
+    args.push("--no-session-persistence");
 
     return args;
   }

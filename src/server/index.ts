@@ -160,18 +160,25 @@ export async function startServer(config: ServerConfig): Promise<Server> {
           }
         },
         onConnectionChange: (connected) => {
-          gatewayConnected = connected;
+          // Only update if connecting (true). Don't downgrade to false —
+          // session mode stays enabled even if gateway WebSocket drops.
+          // Gateway sync is an enhancement, not a requirement.
+          if (connected) gatewayConnected = true;
         },
       });
+      // Enable session mode immediately — gateway sync is optional enhancement
+      // If the WebSocket connects, great. If not, session mode still works
+      // (just no real-time reset/compact notifications from OpenClaw)
+      gatewayConnected = true;
       sync.connect();
-      console.error("[Server] Gateway sync initialized");
+      console.error("[Server] Gateway sync initialized, session mode enabled");
     } else {
-      console.error("[Server] No gateway config found, running stateless");
-      gatewayConnected = true; // Allow session mode without gateway sync
+      console.error("[Server] No gateway config found, session mode enabled without sync");
+      gatewayConnected = true;
     }
   } catch {
-    console.error("[Server] Gateway sync unavailable, running stateless");
-    gatewayConnected = true; // Allow session mode without gateway sync
+    console.error("[Server] Gateway sync unavailable, session mode enabled without sync");
+    gatewayConnected = true;
   }
 
   // Inject components into routes
