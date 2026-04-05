@@ -1,165 +1,212 @@
 /**
- * Session Manager
- *
- * Maps Clawdbot conversation IDs to Claude CLI session IDs
- * for maintaining conversation context across requests.
+ * Session Registry — tracks active agent sessions with message history,
+ * state management, and disk persistence. Replaces the old SessionManager.
  */
 
 import { v4 as uuidv4 } from "uuid";
 import fs from "fs/promises";
-import path from "path";
+import { hashMessage } from "./differ.js";
 
-export interface SessionMapping {
-  clawdbotId: string;
-  claudeSessionId: string;
-  createdAt: number;
-  lastUsedAt: number;
-  model: string;
+interface Message {
+  role: string;
+  content: string | unknown[];
 }
 
-const SESSION_FILE = path.join(
-  process.env.HOME || "/tmp",
-  ".claude-code-cli-sessions.json"
-);
+export interface SessionEntry {
+  agentKey: string;
+  sessionUUID: string;
+  messagesRaw: Message[];
+  messagesHashes: string[];
+  lastActivity: number;
+  state: "idle" | "busy" | "invalidated";
+  model: string;
+  requestCount: number;
+  fallbackCount: number;
+  openclawSessionKey: string | null;
+}
 
-// Session TTL: 24 hours
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+export interface RegistryOptions {
+  ttlMs: number;
+  persistPath: string;
+  persistIntervalMs: number;
+}
 
-class SessionManager {
-  private sessions: Map<string, SessionMapping> = new Map();
-  private loaded: boolean = false;
+export class SessionRegistry {
+  private entries = new Map<string, SessionEntry>();
+  private opts: RegistryOptions;
+  private persistTimer: ReturnType<typeof setInterval> | null = null;
+  private evictTimer: ReturnType<typeof setInterval> | null = null;
 
-  /**
-   * Load sessions from disk
-   */
-  async load(): Promise<void> {
-    if (this.loaded) return;
-
-    try {
-      const data = await fs.readFile(SESSION_FILE, "utf-8");
-      const parsed = JSON.parse(data) as Record<string, SessionMapping>;
-      this.sessions = new Map(Object.entries(parsed));
-      this.loaded = true;
-      console.log(`[SessionManager] Loaded ${this.sessions.size} sessions`);
-    } catch {
-      // File doesn't exist or is invalid, start fresh
-      this.sessions = new Map();
-      this.loaded = true;
-    }
-  }
-
-  /**
-   * Save sessions to disk
-   */
-  async save(): Promise<void> {
-    const data = Object.fromEntries(this.sessions);
-    await fs.writeFile(SESSION_FILE, JSON.stringify(data, null, 2));
-  }
-
-  /**
-   * Get or create a Claude session ID for a Clawdbot conversation
-   */
-  getOrCreate(clawdbotId: string, model: string = "sonnet"): string {
-    const existing = this.sessions.get(clawdbotId);
-
-    if (existing) {
-      // Update last used time
-      existing.lastUsedAt = Date.now();
-      existing.model = model;
-      return existing.claudeSessionId;
-    }
-
-    // Create new session
-    const claudeSessionId = uuidv4();
-    const mapping: SessionMapping = {
-      clawdbotId,
-      claudeSessionId,
-      createdAt: Date.now(),
-      lastUsedAt: Date.now(),
-      model,
+  constructor(opts: Partial<RegistryOptions> = {}) {
+    this.opts = {
+      ttlMs: opts.ttlMs ?? 6 * 60 * 60 * 1000, // 6h
+      persistPath: opts.persistPath ?? "",
+      persistIntervalMs: opts.persistIntervalMs ?? 60_000,
     };
 
-    this.sessions.set(clawdbotId, mapping);
-    console.log(
-      `[SessionManager] Created session: ${clawdbotId} -> ${claudeSessionId}`
-    );
+    // Start periodic eviction (every 10 min) — only if not in test mode
+    if (this.opts.ttlMs > 1000) {
+      this.evictTimer = setInterval(() => this.evictStale(), 10 * 60 * 1000);
+    }
 
-    // Fire and forget save
-    this.save().catch((err) =>
-      console.error("[SessionManager] Save error:", err)
-    );
-
-    return claudeSessionId;
-  }
-
-  /**
-   * Get existing session if it exists
-   */
-  get(clawdbotId: string): SessionMapping | undefined {
-    return this.sessions.get(clawdbotId);
-  }
-
-  /**
-   * Delete a session
-   */
-  delete(clawdbotId: string): boolean {
-    const deleted = this.sessions.delete(clawdbotId);
-    if (deleted) {
-      this.save().catch((err) =>
-        console.error("[SessionManager] Save error:", err)
+    // Start periodic persistence
+    if (this.opts.persistPath) {
+      this.persistTimer = setInterval(
+        () => this.saveToDisk(),
+        this.opts.persistIntervalMs
       );
     }
-    return deleted;
   }
 
-  /**
-   * Clean up expired sessions
-   */
-  cleanup(): number {
-    const cutoff = Date.now() - SESSION_TTL_MS;
-    let removed = 0;
+  getOrCreate(
+    agentKey: string,
+    model: string,
+    _messages: Message[]
+  ): SessionEntry {
+    const existing = this.entries.get(agentKey);
 
-    for (const [key, session] of this.sessions) {
-      if (session.lastUsedAt < cutoff) {
-        this.sessions.delete(key);
+    if (existing && existing.state !== "invalidated") {
+      existing.lastActivity = Date.now();
+      return existing;
+    }
+
+    // Create new (or replace invalidated)
+    const entry: SessionEntry = {
+      agentKey,
+      sessionUUID: uuidv4(),
+      messagesRaw: [],
+      messagesHashes: [],
+      lastActivity: Date.now(),
+      state: "idle",
+      model,
+      requestCount: 0,
+      fallbackCount: 0,
+      openclawSessionKey: null,
+    };
+
+    this.entries.set(agentKey, entry);
+    return entry;
+  }
+
+  get(agentKey: string): SessionEntry | undefined {
+    return this.entries.get(agentKey);
+  }
+
+  invalidate(agentKey: string): void {
+    const entry = this.entries.get(agentKey);
+    if (entry) entry.state = "invalidated";
+  }
+
+  remove(agentKey: string): void {
+    this.entries.delete(agentKey);
+  }
+
+  updateHistory(
+    agentKey: string,
+    messages: Message[],
+    replace: boolean
+  ): void {
+    const entry = this.entries.get(agentKey);
+    if (!entry) return;
+
+    entry.messagesRaw = [...messages];
+    entry.messagesHashes = messages.map(hashMessage);
+    entry.requestCount++;
+    entry.lastActivity = Date.now();
+  }
+
+  setBusy(agentKey: string): void {
+    const entry = this.entries.get(agentKey);
+    if (entry) entry.state = "busy";
+  }
+
+  setIdle(agentKey: string): void {
+    const entry = this.entries.get(agentKey);
+    if (entry && entry.state === "busy") entry.state = "idle";
+  }
+
+  incrementFallback(agentKey: string): void {
+    const entry = this.entries.get(agentKey);
+    if (entry) entry.fallbackCount++;
+  }
+
+  evictStale(): number {
+    const cutoff = Date.now() - this.opts.ttlMs;
+    let removed = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.lastActivity < cutoff) {
+        this.entries.delete(key);
         removed++;
       }
     }
-
     if (removed > 0) {
-      console.log(`[SessionManager] Cleaned up ${removed} expired sessions`);
-      this.save().catch((err) =>
-        console.error("[SessionManager] Save error:", err)
-      );
+      console.error(`[Registry] Evicted ${removed} stale sessions`);
     }
-
     return removed;
   }
 
-  /**
-   * Get all active sessions
-   */
-  getAll(): SessionMapping[] {
-    return Array.from(this.sessions.values());
+  get size(): number {
+    return this.entries.size;
   }
 
-  /**
-   * Get session count
-   */
-  get size(): number {
-    return this.sessions.size;
+  getAll(): SessionEntry[] {
+    return Array.from(this.entries.values());
+  }
+
+  async saveToDisk(): Promise<void> {
+    if (!this.opts.persistPath) return;
+    try {
+      const data = Object.fromEntries(
+        Array.from(this.entries.entries()).map(([k, v]) => [
+          k,
+          {
+            agentKey: v.agentKey,
+            sessionUUID: v.sessionUUID,
+            model: v.model,
+            lastActivity: v.lastActivity,
+            requestCount: v.requestCount,
+            fallbackCount: v.fallbackCount,
+            state: v.state === "busy" ? "idle" : v.state,
+          },
+        ])
+      );
+      await fs.writeFile(this.opts.persistPath, JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.error("[Registry] Save error:", err);
+    }
+  }
+
+  async loadFromDisk(): Promise<void> {
+    if (!this.opts.persistPath) return;
+    try {
+      const raw = await fs.readFile(this.opts.persistPath, "utf-8");
+      const data = JSON.parse(raw) as Record<string, Partial<SessionEntry>>;
+      for (const [key, saved] of Object.entries(data)) {
+        if (!this.entries.has(key) && saved.sessionUUID) {
+          this.entries.set(key, {
+            agentKey: saved.agentKey ?? key,
+            sessionUUID: saved.sessionUUID,
+            messagesRaw: [],
+            messagesHashes: [],
+            lastActivity: saved.lastActivity ?? Date.now(),
+            state: "invalidated", // force full prompt after reload
+            model: saved.model ?? "opus",
+            requestCount: saved.requestCount ?? 0,
+            fallbackCount: saved.fallbackCount ?? 0,
+            openclawSessionKey: null,
+          });
+        }
+      }
+      console.error(
+        `[Registry] Loaded ${this.entries.size} sessions from disk`
+      );
+    } catch {
+      // File doesn't exist yet — normal on first run
+    }
+  }
+
+  shutdown(): void {
+    if (this.persistTimer) clearInterval(this.persistTimer);
+    if (this.evictTimer) clearInterval(this.evictTimer);
   }
 }
-
-// Singleton instance
-export const sessionManager = new SessionManager();
-
-// Initialize on module load
-sessionManager.load().catch((err) =>
-  console.error("[SessionManager] Load error:", err)
-);
-
-// Periodic cleanup every hour
-setInterval(() => {
-  sessionManager.cleanup();
-}, 60 * 60 * 1000);
